@@ -2,6 +2,306 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ориентация КА - Симулятор</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #121212;
+      color: #f0f0f0;
+    }
+    h2 { text-align: center; margin-bottom: 20px; }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 15px;
+      justify-content: center;
+      background: #1e1e1e;
+      padding: 15px;
+      border-radius: 12px;
+      margin-bottom: 20px;
+    }
+    .controls label {
+      display: flex;
+      flex-direction: column;
+      font-size: 14px;
+      color: #ccc;
+    }
+    .controls input, .controls select, .controls button {
+      padding: 8px;
+      font-size: 14px;
+      border-radius: 8px;
+      border: none;
+      margin-top: 4px;
+    }
+    .controls button {
+      background: #03dac6;
+      color: #000;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    canvas {
+      background: #fff;
+      border-radius: 12px;
+      max-width: 100%;
+      height: auto;
+      display: block;
+      margin: 0 auto;
+    }
+    #three-container {
+      width: 100%;
+      max-width: 800px;
+      height: 400px;
+      margin: 30px auto;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    #debug {
+      margin-top: 10px;
+      text-align: center;
+      font-size: 14px;
+      color: #aaa;
+    }
+    @media (max-width: 768px) {
+      .controls {
+        flex-direction: column;
+        align-items: center;
+      }
+      #three-container {
+        height: 300px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h2>Симулятор ориентации космического аппарата</h2>
+  <div class="controls">
+    <label>Метод:
+      <select id="method">
+        <option value="quaternion">Кватернионы</option>
+        <option value="ins">INS (интеграция)</option>
+        <option value="gyro">Мобильный гироскоп</option>
+      </select>
+    </label>
+    <label>Угл. скорость X (рад/с):<input type="number" id="omegaX" value="0.1" step="0.01"></label>
+    <label>Y:<input type="number" id="omegaY" value="0.1" step="0.01"></label>
+    <label>Z:<input type="number" id="omegaZ" value="0.1" step="0.01"></label>
+    <label>Шум (σ):<input type="number" id="noise" value="0.02" step="0.01"></label>
+    <label>Длительность (с):<input type="number" id="duration" value="10"></label>
+    <button onclick="runSimulation()">▶ Старт</button>
+    <button onclick="exportCSV()">⬇ CSV</button>
+    <button onclick="stopGyro()">⛔ Гироскоп</button>
+  </div>
+  <canvas id="orientationChart" width="800" height="400"></canvas>
+  <div id="three-container"></div>
+  <div id="debug"></div>
+
+  <script>
+    let scene, camera, renderer, cube;
+    let exportData = [];
+    let gyroActive = false;
+
+    function init3D() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(75, 2, 0.1, 1000);
+      renderer = new THREE.WebGLRenderer();
+      renderer.setSize(800, 400);
+      document.getElementById('three-container').appendChild(renderer.domElement);
+
+      const geometry = new THREE.BoxGeometry(1, 1, 2);
+      const material = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
+      cube = new THREE.Mesh(geometry, material);
+      scene.add(cube);
+
+      camera.position.z = 5;
+      renderer.render(scene, camera);
+    }
+
+    function updateCubeOrientation(x, y, z) {
+      cube.rotation.set(x, y, z);
+      renderer.render(scene, camera);
+    }
+
+    function runSimulation() {
+      const method = document.getElementById('method').value;
+      const omegaX = parseFloat(document.getElementById('omegaX').value);
+      const omegaY = parseFloat(document.getElementById('omegaY').value);
+      const omegaZ = parseFloat(document.getElementById('omegaZ').value);
+      const noise = parseFloat(document.getElementById('noise').value);
+      const duration = parseInt(document.getElementById('duration').value);
+
+      const dt = 0.1;
+      const steps = Math.floor(duration / dt);
+
+      const time = [];
+      const anglesX = [], anglesY = [], anglesZ = [];
+      exportData = [];
+
+      let currentStep = 0;
+      const animateSteps = [];
+
+      let q = [1, 0, 0, 0];
+      let angleX = 0, angleY = 0, angleZ = 0;
+
+      function quatMultiply(q1, q2) {
+        const [w1, x1, y1, z1] = q1;
+        const [w2, x2, y2, z2] = q2;
+        return [
+          w1*w2 - x1*x2 - y1*y2 - z1*z2,
+          w1*x2 + x1*w2 + y1*z2 - z1*y2,
+          w1*y2 - x1*z2 + y1*w2 + z1*x2,
+          w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ];
+      }
+
+      function normalize(q) {
+        const norm = Math.sqrt(q[0]**2 + q[1]**2 + q[2]**2 + q[3]**2);
+        return q.map(v => v / norm);
+      }
+
+      if (method === "gyro") {
+        document.getElementById("debug").innerText = "Ожидаем разрешения на доступ к гироскопу...";
+        if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+          DeviceOrientationEvent.requestPermission().then(permissionState => {
+            if (permissionState === 'granted') {
+              window.addEventListener('deviceorientation', handleOrientation);
+              document.getElementById("debug").innerText = "Гироскоп активен. Вращайте устройство.";
+              gyroActive = true;
+            } else {
+              document.getElementById("debug").innerText = "Доступ к гироскопу не получен.";
+            }
+          }).catch(error => {
+            console.error(error);
+            document.getElementById("debug").innerText = "Ошибка запроса доступа к гироскопу.";
+          });
+        } else {
+          window.addEventListener('deviceorientation', handleOrientation);
+          document.getElementById("debug").innerText = "Гироскоп активен (без запроса). Вращайте устройство.";
+          gyroActive = true;
+        }
+        return;
+      }
+
+      for (let i = 0; i <= steps; i++) {
+        const t = i * dt;
+        const wx = omegaX + randomNoise(noise);
+        const wy = omegaY + randomNoise(noise);
+        const wz = omegaZ + randomNoise(noise);
+
+        let rotX = 0, rotY = 0, rotZ = 0;
+
+        if (method === "quaternion") {
+          const omegaQuat = [0, wx, wy, wz];
+          const dq = quatMultiply(q, omegaQuat).map(v => v * 0.5 * dt);
+          q = normalize([q[0] + dq[0], q[1] + dq[1], q[2] + dq[2], q[3] + dq[3]]);
+          const [w, x, y, z] = q;
+          rotX = Math.atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y));
+          rotY = Math.asin(2*(w*y - z*x));
+          rotZ = Math.atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z));
+        } else if (method === "ins") {
+          angleX += wx * dt;
+          angleY += wy * dt;
+          angleZ += wz * dt;
+          rotX = angleX;
+          rotY = angleY;
+          rotZ = angleZ;
+        }
+
+        time.push(t.toFixed(1));
+        anglesX.push(rotX);
+        anglesY.push(rotY);
+        anglesZ.push(rotZ);
+        animateSteps.push([rotX, rotY, rotZ]);
+        exportData.push([t.toFixed(2), rotX, rotY, rotZ]);
+      }
+
+      const ctx = document.getElementById('orientationChart').getContext('2d');
+      if (window.chart) window.chart.destroy();
+      window.chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: time,
+          datasets: [
+            { label: 'Угол X', data: anglesX, borderColor: 'red', fill: false },
+            { label: 'Угол Y', data: anglesY, borderColor: 'green', fill: false },
+            { label: 'Угол Z', data: anglesZ, borderColor: 'blue', fill: false }
+          ]
+        },
+        options: {
+          responsive: true,
+          scales: {
+            x: { title: { display: true, text: 'Время (с)' } },
+            y: { title: { display: true, text: 'Угол (рад)' } }
+          }
+        }
+      });
+
+      let interval = setInterval(() => {
+        if (currentStep < animateSteps.length) {
+          const [x, y, z] = animateSteps[currentStep];
+          updateCubeOrientation(x, y, z);
+          currentStep++;
+        } else {
+          clearInterval(interval);
+        }
+      }, dt * 1000);
+    }
+
+    function stopGyro() {
+      if (gyroActive) {
+        window.removeEventListener('deviceorientation', handleOrientation);
+        document.getElementById("debug").innerText = "Гироскоп остановлен.";
+        gyroActive = false;
+      }
+    }
+
+    function handleOrientation(event) {
+      const alpha = event.alpha || 0;
+      const beta = event.beta || 0;
+      const gamma = event.gamma || 0;
+
+      const x = beta * Math.PI / 180;
+      const y = gamma * Math.PI / 180;
+      const z = alpha * Math.PI / 180;
+
+      updateCubeOrientation(x, y, z);
+      document.getElementById("debug").innerText = `Гироскоп: α=${alpha.toFixed(1)}, β=${beta.toFixed(1)}, γ=${gamma.toFixed(1)}`;
+    }
+
+    function randomNoise(std) {
+      return std * (Math.random() * 2 - 1);
+    }
+
+    function exportCSV() {
+      let csv = 'Время,Угол X,Угол Y,Угол Z\n';
+      exportData.forEach(row => {
+        csv += row.join(',') + '\n';
+      });
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'orientation_data.csv';
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    init3D();
+  </script>
+</body>
+</html>
+
+
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
   <title>Ориентация КА - Симулятор</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
@@ -230,3 +530,4 @@
   </script>
 </body>
 </html>
+ -->
